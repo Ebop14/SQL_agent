@@ -22,6 +22,7 @@ import re
 import sqlite3
 from dotenv import load_dotenv
 from formatter import Formatter, Colors
+from schema_tags import get_all_tags, format_tags_for_prompt
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,6 +34,7 @@ class NaturalLanguageQueryAgent:
 
     Features:
     - Translates natural language to SQL via Claude
+    - Uses semantic column tags for better understanding
     - Shows reasoning and set-theory interpretation
     - Displays formatted results as tables
     - Full transparency on every operation
@@ -43,6 +45,7 @@ class NaturalLanguageQueryAgent:
         self.conn = None
         self.fmt = Formatter()
         self._schema_cache = None
+        self._tags_cache = None
 
         # Check for API key
         resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -75,8 +78,28 @@ class NaturalLanguageQueryAgent:
         self.disconnect()
 
     # =========================================================================
-    # SCHEMA EXTRACTION
+    # TAGS & SCHEMA
     # =========================================================================
+
+    def _load_tags(self) -> dict:
+        """Load column tags from database."""
+        if self._tags_cache is not None:
+            return self._tags_cache
+
+        try:
+            self._tags_cache = get_all_tags(self.db_path)
+        except Exception:
+            # Tags table might not exist yet
+            self._tags_cache = {}
+
+        return self._tags_cache
+
+    def _get_tags_for_prompt(self) -> str:
+        """Get formatted tags for LLM prompt."""
+        tags = self._load_tags()
+        if not tags:
+            return ""
+        return format_tags_for_prompt(tags)
 
     def _get_schema_for_llm(self) -> str:
         """Get schema description for the LLM prompt."""
@@ -154,17 +177,30 @@ class NaturalLanguageQueryAgent:
         print(self.fmt.step(1, "Question Received", "User input"))
         print(self.fmt.text_block("Input", question, "?"))
 
-        # Step 2: Schema (optional display)
-        if show_schema:
-            print(self.fmt.step(2, "Database Schema", "sqlite_master + PRAGMA"))
-            print(self.fmt.schema_compact(self._get_schema_display()))
+        # Step 2: Load column tags
+        print(self.fmt.step(2, "Reading Column Tags", "column_tags table"))
+        tags = self._load_tags()
+        tag_count = sum(len(cols) for cols in tags.values())
+        if tag_count > 0:
+            # Show a summary of tags loaded
+            tables_with_tags = list(tags.keys())
+            print(self.fmt.text_block("Loaded", f"{tag_count} column tags from {len(tables_with_tags)} tables: {', '.join(tables_with_tags)}", "📑"))
+        else:
+            print(self.fmt.text_block("Warning", "No column tags found. Run: python schema_tags.py", "⚠"))
 
-        # Step 3: Call LLM
-        step_num = 3 if show_schema else 2
+        # Step 3: Schema (optional display)
+        step_num = 3
+        if show_schema:
+            print(self.fmt.step(step_num, "Database Schema", "sqlite_master + PRAGMA"))
+            print(self.fmt.schema_compact(self._get_schema_display()))
+            step_num += 1
+
+        # Step 4: Call LLM
         print(self.fmt.step(step_num, "Translating to SQL", "Claude API (claude-sonnet-4-20250514)"))
 
         schema = self._get_schema_for_llm()
-        prompt = self._build_prompt(question, schema)
+        tags_prompt = self._get_tags_for_prompt()
+        prompt = self._build_prompt(question, schema, tags_prompt)
         response = self._call_llm(prompt)
         parsed = self._parse_response(response)
 
@@ -176,7 +212,11 @@ class NaturalLanguageQueryAgent:
         if parsed.get('set_theory'):
             print(self.fmt.text_block("Set Theory", parsed['set_theory'], "∴"))
 
-        # Step 4: Show SQL
+        # Show which tags were used
+        if parsed.get('tags_used'):
+            print(self.fmt.text_block("Tags Used", parsed['tags_used'], "🏷"))
+
+        # Step: Show SQL
         step_num += 1
         print(self.fmt.step(step_num, "Generated SQL", "LLM output"))
         if parsed.get('sql'):
@@ -185,7 +225,7 @@ class NaturalLanguageQueryAgent:
             print(self.fmt.error("No SQL generated"))
             return parsed
 
-        # Step 5: Execute
+        # Step: Execute
         step_num += 1
         print(self.fmt.step(step_num, "Execution", f"SQLite ({self.db_path})"))
 
@@ -209,18 +249,26 @@ class NaturalLanguageQueryAgent:
 
         return parsed
 
-    def _build_prompt(self, question: str, schema: str) -> str:
-        """Build the LLM prompt."""
+    def _build_prompt(self, question: str, schema: str, tags: str = "") -> str:
+        """Build the LLM prompt with schema and semantic tags."""
+        tags_section = f"\n{tags}\n" if tags else ""
+
         return f"""You are a SQL expert. Translate the natural language question into a SQLite query.
 
 {schema}
-
+{tags_section}
 QUESTION: {question}
+
+The COLUMN TAGS above provide semantic meaning for each column. Use them to:
+- Understand what each column represents in business terms
+- Choose the right columns for the query
+- Identify which columns to use for joins, filters, and aggregations
 
 Respond in JSON format:
 {{
     "reasoning": "Step-by-step explanation of your interpretation",
     "set_theory": "Explain using set theory (joins as intersections, filters as selections, etc.)",
+    "tags_used": "List the column tags that were most relevant (e.g., 'customer_name, total_spending')",
     "sql": "The SQLite query",
     "explanation": "One-sentence summary"
 }}
@@ -229,7 +277,7 @@ Rules:
 1. Only use tables/columns from the schema
 2. Use table aliases in JOINs
 3. Be precise - don't return more than asked
-4. For ambiguous questions, state assumptions in reasoning
+4. Reference the column tags to understand what data means
 
 JSON only, no other text."""
 
@@ -273,6 +321,7 @@ JSON only, no other text."""
     Commands:
       • Type a question in plain English
       • {Colors.CYAN}schema{Colors.RESET}  - Show database structure
+      • {Colors.CYAN}tags{Colors.RESET}    - Show column tags & meanings
       • {Colors.CYAN}help{Colors.RESET}    - Show example questions
       • {Colors.CYAN}quit{Colors.RESET}    - Exit
 """)
@@ -291,6 +340,9 @@ JSON only, no other text."""
                     print(self.fmt.header("DATABASE SCHEMA"))
                     print(self.fmt.schema_compact(self._get_schema_display()))
                     continue
+                if question.lower() == 'tags':
+                    self._show_tags()
+                    continue
                 if question.lower() == 'help':
                     self._show_help()
                     continue
@@ -302,6 +354,24 @@ JSON only, no other text."""
                 break
             except Exception as e:
                 print(self.fmt.error(str(e)))
+
+    def _show_tags(self):
+        """Show all column tags."""
+        print(self.fmt.header("COLUMN TAGS"))
+        tags = self._load_tags()
+
+        if not tags:
+            print(f"\n    {Colors.YELLOW}No tags found.{Colors.RESET}")
+            print(f"    Run: {Colors.CYAN}python schema_tags.py{Colors.RESET} to create them.\n")
+            return
+
+        for table, columns in tags.items():
+            print(f"\n    {Colors.BOLD}{table}{Colors.RESET}")
+            print(f"    {Colors.DIM}{'─' * 50}{Colors.RESET}")
+            for col, meta in columns.items():
+                print(f"      {Colors.CYAN}{col}{Colors.RESET} → {Colors.YELLOW}{meta['tag']}{Colors.RESET}")
+                print(f"        {Colors.DIM}{meta['description']}{Colors.RESET}")
+                print(f"        {Colors.DIM}Use for: {meta['use_for']}{Colors.RESET}")
 
     def _show_help(self):
         """Show example questions."""

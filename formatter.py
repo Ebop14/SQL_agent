@@ -106,10 +106,44 @@ class Formatter:
         return f"\n{Colors.GREEN}{icon} {title}:{Colors.RESET}\n{wrapped}"
 
     @staticmethod
+    def _format_value(val: Any, width: int) -> str:
+        """Format a value for display with proper alignment and formatting."""
+        if val is None:
+            return f"{Colors.DIM}{'NULL':^{width}}{Colors.RESET}"
+
+        # Format numbers nicely
+        if isinstance(val, float):
+            # Check if it looks like currency (2 decimal places make sense)
+            if abs(val) >= 1000:
+                formatted = f"{val:,.2f}"
+            else:
+                formatted = f"{val:.2f}"
+            # Right-align numbers
+            if len(formatted) > width:
+                formatted = formatted[:width-3] + "..."
+            return f"{formatted:>{width}}"
+        elif isinstance(val, int):
+            formatted = f"{val:,}"
+            if len(formatted) > width:
+                formatted = formatted[:width-3] + "..."
+            return f"{formatted:>{width}}"
+        else:
+            # String value - left align
+            s = str(val)
+            if len(s) > width:
+                s = s[:width-3] + "..."
+            return f"{s:<{width}}"
+
+    @staticmethod
     def table(rows: list[dict], max_rows: int = 20) -> str:
-        """Format results as a clean table."""
+        """Format results as a clean boxed table."""
         if not rows:
-            return f"    {Colors.DIM}(no results){Colors.RESET}"
+            box_width = 30
+            return (
+                f"\n    {Colors.DIM}╭{'─' * box_width}╮{Colors.RESET}\n"
+                f"    {Colors.DIM}│{Colors.RESET}{'No results':^{box_width}}{Colors.DIM}│{Colors.RESET}\n"
+                f"    {Colors.DIM}╰{'─' * box_width}╯{Colors.RESET}"
+            )
 
         # Get column names and widths
         columns = list(rows[0].keys())
@@ -118,39 +152,57 @@ class Formatter:
         for col in columns:
             max_width = len(str(col))
             for row in rows[:max_rows]:
-                val_len = len(str(row.get(col, '')))
-                max_width = max(max_width, min(val_len, 30))  # Cap at 30 chars
+                val = row.get(col, '')
+                # Format value to get actual display width
+                if isinstance(val, float):
+                    val_str = f"{val:,.2f}" if abs(val) >= 1000 else f"{val:.2f}"
+                elif isinstance(val, int):
+                    val_str = f"{val:,}"
+                else:
+                    val_str = str(val) if val is not None else "NULL"
+                max_width = max(max_width, min(len(val_str), 30))
             col_widths[col] = max_width
 
-        # Build the table
+        # Calculate total table width
+        content_width = sum(col_widths.values()) + (len(columns) - 1) * 3  # 3 for " │ "
+
         output = []
 
-        # Header
+        # Top border
+        output.append(f"    {Colors.DIM}╭{'─' * (content_width + 2)}╮{Colors.RESET}")
+
+        # Header row
         header_parts = []
         for col in columns:
-            header_parts.append(f"{Colors.BOLD}{col:<{col_widths[col]}}{Colors.RESET}")
+            # Center and bold the header
+            header_parts.append(f"{Colors.BOLD}{Colors.CYAN}{col:^{col_widths[col]}}{Colors.RESET}")
         header = " │ ".join(header_parts)
-        output.append(f"    {header}")
+        output.append(f"    {Colors.DIM}│{Colors.RESET} {header} {Colors.DIM}│{Colors.RESET}")
 
-        # Separator
+        # Header separator
         sep_parts = ["─" * col_widths[col] for col in columns]
-        output.append(f"    {'─┼─'.join(sep_parts)}")
+        output.append(f"    {Colors.DIM}├{'─┼─'.join(sep_parts)}──┤{Colors.RESET}")
 
-        # Rows
+        # Data rows
         display_rows = rows[:max_rows]
-        for row in display_rows:
+        for i, row in enumerate(display_rows):
             row_parts = []
             for col in columns:
-                val = str(row.get(col, ''))
-                if len(val) > 30:
-                    val = val[:27] + "..."
-                row_parts.append(f"{val:<{col_widths[col]}}")
-            output.append(f"    {' │ '.join(row_parts)}")
+                val = row.get(col)
+                formatted = Formatter._format_value(val, col_widths[col])
+                row_parts.append(formatted)
+            row_str = " │ ".join(row_parts)
+            output.append(f"    {Colors.DIM}│{Colors.RESET} {row_str} {Colors.DIM}│{Colors.RESET}")
 
+        # Bottom border
+        output.append(f"    {Colors.DIM}╰{'─' * (content_width + 2)}╯{Colors.RESET}")
+
+        # Summary line
         if len(rows) > max_rows:
-            output.append(f"    {Colors.DIM}... and {len(rows) - max_rows} more rows{Colors.RESET}")
-
-        output.append(f"\n    {Colors.DIM}({len(rows)} row{'s' if len(rows) != 1 else ''} returned){Colors.RESET}")
+            summary = f"{len(rows):,} rows ({max_rows} shown)"
+        else:
+            summary = f"{len(rows):,} row{'s' if len(rows) != 1 else ''}"
+        output.append(f"    {Colors.DIM}{summary}{Colors.RESET}")
 
         return '\n'.join(output)
 
@@ -216,8 +268,19 @@ def demo():
         {"name": "Alice Johnson", "total_spending": 3502.85},
     ]
     print(f.table(results))
+    print(f.success("Query completed"))
 
-    print(f.success("Query completed successfully"))
+    # Demo empty results
+    print(f.step(5, "Empty Results Demo", ""))
+    print(f.table([]))
+
+    # Demo with larger numbers
+    print(f.step(6, "Large Numbers Demo", ""))
+    large_results = [
+        {"product": "Widget Pro", "units_sold": 12345, "revenue": 1234567.89},
+        {"product": "Gadget Plus", "units_sold": 9876, "revenue": 987654.32},
+    ]
+    print(f.table(large_results))
 
 
 if __name__ == "__main__":

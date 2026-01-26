@@ -23,6 +23,11 @@ import sqlite3
 from dotenv import load_dotenv
 from formatter import Formatter, Colors
 from schema_tags import get_all_tags, format_tags_for_prompt
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.styles import Style
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.formatted_text import HTML
 
 # Load environment variables from .env file
 load_dotenv()
@@ -237,7 +242,6 @@ class NaturalLanguageQueryAgent:
             results = [dict(zip(columns, row)) for row in rows]
 
             print(self.fmt.table(results))
-            print(self.fmt.success("Query completed"))
 
             parsed['results'] = results
             parsed['success'] = True
@@ -246,6 +250,26 @@ class NaturalLanguageQueryAgent:
             print(self.fmt.error(str(e)))
             parsed['error'] = str(e)
             parsed['success'] = False
+            return parsed
+
+        # Step: Interpretation
+        step_num += 1
+        print(self.fmt.step(step_num, "Interpretation", "Claude API"))
+
+        interpretation = self._interpret_results(
+            question=question,
+            sql=parsed.get('sql', ''),
+            results=results,
+            reasoning=parsed.get('reasoning', '')
+        )
+
+        if interpretation.get('summary'):
+            print(self.fmt.text_block("Answer", interpretation['summary'], "💬"))
+
+        if interpretation.get('limitations'):
+            print(self.fmt.text_block("Limitations", interpretation['limitations'], "⚠"))
+
+        parsed['interpretation'] = interpretation
 
         return parsed
 
@@ -308,6 +332,42 @@ JSON only, no other text."""
                 'error': 'Failed to parse LLM response'
             }
 
+    def _interpret_results(self, question: str, sql: str, results: list, reasoning: str) -> dict:
+        """Generate a natural language interpretation of the results."""
+        # Limit results shown to LLM to avoid token limits
+        results_preview = results[:20] if len(results) > 20 else results
+        results_note = f" (showing first 20 of {len(results)})" if len(results) > 20 else ""
+
+        prompt = f"""You are a data analyst explaining query results to a business user.
+
+ORIGINAL QUESTION: {question}
+
+SQL EXECUTED:
+{sql}
+
+QUERY REASONING: {reasoning}
+
+RESULTS{results_note}:
+{json.dumps(results_preview, indent=2, default=str)}
+
+Provide a natural language interpretation. Respond in JSON:
+{{
+    "summary": "A direct, conversational answer to the question. Use specific numbers and names from the results. Be concise but complete. Examples: 'You have 5 customers in the database.' or 'Carol Williams is your top customer with $6,518.73 in total spending, followed by Eva Martinez ($3,953.79) and Alice Johnson ($3,502.85).'",
+    "limitations": "Note any caveats, edge cases, or potential issues with interpreting these results. Consider: data freshness, what the query doesn't account for (returns, cancellations, time periods), assumptions made, potential for misleading conclusions. If there are no significant limitations, use null."
+}}
+
+Be specific and actionable. If there are no results, explain what that means.
+JSON only, no other text."""
+
+        try:
+            response = self._call_llm(prompt)
+            return self._parse_response(response)
+        except Exception as e:
+            return {
+                'summary': f"Results returned {len(results)} row(s).",
+                'limitations': f"Could not generate interpretation: {str(e)}"
+            }
+
     # =========================================================================
     # INTERACTIVE MODE
     # =========================================================================
@@ -324,12 +384,64 @@ JSON only, no other text."""
       • {Colors.CYAN}tags{Colors.RESET}    - Show column tags & meanings
       • {Colors.CYAN}help{Colors.RESET}    - Show example questions
       • {Colors.CYAN}quit{Colors.RESET}    - Exit
+
+    {Colors.DIM}Tab to auto-fill example • Shift+arrows select • Cmd+Z undo{Colors.RESET}
 """)
+
+        # Example prompts that cycle through
+        examples = [
+            "How many customers do we have?",
+            "What products are in the Electronics category?",
+            "Show me all pending orders",
+            "Who are our top 3 customers by spending?",
+            "What's the total revenue by category?",
+            "Which customers have placed orders?",
+            "What products have never been ordered?",
+            "What's the average order value per customer?",
+        ]
+        example_index = [0]  # Use list to allow mutation in closure
+
+        # Set up key bindings
+        bindings = KeyBindings()
+
+        @bindings.add('tab')
+        def accept_placeholder(event):
+            """Tab inserts the current example if buffer is empty."""
+            buf = event.app.current_buffer
+            if not buf.text:
+                buf.insert_text(examples[example_index[0]])
+
+        # Set up prompt styling and history
+        prompt_style = Style.from_dict({
+            'prompt': 'ansigreen bold',
+            'placeholder': 'ansigray',
+        })
+
+        # Store history in user's home directory
+        history_file = os.path.expanduser("~/.sql_agent_history")
+        history = FileHistory(history_file)
+
+        # Create session for persistent settings
+        session = PromptSession(
+            history=history,
+            enable_history_search=True,
+            key_bindings=bindings,
+            style=prompt_style,
+        )
 
         while True:
             try:
-                print(f"\n{Colors.GREEN}?{Colors.RESET} ", end="")
-                question = input().strip()
+                # Get current placeholder
+                current_example = examples[example_index[0]]
+                placeholder = HTML(f'<placeholder>{current_example}</placeholder>')
+
+                question = session.prompt(
+                    [('class:prompt', '? ')],
+                    placeholder=placeholder,
+                ).strip()
+
+                # Cycle to next example for next prompt
+                example_index[0] = (example_index[0] + 1) % len(examples)
 
                 if not question:
                     continue
@@ -351,6 +463,9 @@ JSON only, no other text."""
 
             except KeyboardInterrupt:
                 print(f"\n\n{Colors.DIM}Goodbye!{Colors.RESET}\n")
+                break
+            except EOFError:
+                print(f"\n{Colors.DIM}Goodbye!{Colors.RESET}\n")
                 break
             except Exception as e:
                 print(self.fmt.error(str(e)))

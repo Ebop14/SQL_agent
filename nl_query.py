@@ -21,7 +21,7 @@ import os
 import re
 import sqlite3
 from dotenv import load_dotenv
-from formatter import Formatter, Colors
+from formatter import Formatter, Colors, spinner
 from schema_tags import get_all_tags, format_tags_for_prompt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -42,7 +42,7 @@ class NaturalLanguageQueryAgent:
     - Uses semantic column tags for better understanding
     - Shows reasoning and set-theory interpretation
     - Displays formatted results as tables
-    - Full transparency on every operation
+    - Full transparency on every operation (toggle with Cmd+O)
     """
 
     def __init__(self, db_path: str, api_key: str = None):
@@ -51,6 +51,7 @@ class NaturalLanguageQueryAgent:
         self.fmt = Formatter()
         self._schema_cache = None
         self._tags_cache = None
+        self.verbose = False  # Hide intermediate steps by default
 
         # Check for API key
         resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -176,63 +177,73 @@ class NaturalLanguageQueryAgent:
         Returns:
             dict with 'sql', 'reasoning', 'results', etc.
         """
-        print(self.fmt.header("QUERY"))
+        # Verbose mode shows all steps; compact mode shows only answer + limitations
+        verbose = self.verbose
 
-        # Step 1: Show the question
-        print(self.fmt.step(1, "Question Received", "User input"))
-        print(self.fmt.text_block("Input", question, "?"))
+        if verbose:
+            print(self.fmt.header("QUERY"))
+
+            # Step 1: Show the question
+            print(self.fmt.step(1, "Question Received", "User input"))
+            print(self.fmt.text_block("Input", question, "?"))
 
         # Step 2: Load column tags
-        print(self.fmt.step(2, "Reading Column Tags", "column_tags table"))
+        if verbose:
+            print(self.fmt.step(2, "Reading Column Tags", "column_tags table"))
         tags = self._load_tags()
         tag_count = sum(len(cols) for cols in tags.values())
-        if tag_count > 0:
-            # Show a summary of tags loaded
-            tables_with_tags = list(tags.keys())
-            print(self.fmt.text_block("Loaded", f"{tag_count} column tags from {len(tables_with_tags)} tables: {', '.join(tables_with_tags)}", "📑"))
-        else:
-            print(self.fmt.text_block("Warning", "No column tags found. Run: python schema_tags.py", "⚠"))
+        if verbose:
+            if tag_count > 0:
+                tables_with_tags = list(tags.keys())
+                print(self.fmt.text_block("Loaded", f"{tag_count} column tags from {len(tables_with_tags)} tables: {', '.join(tables_with_tags)}", "📑"))
+            else:
+                print(self.fmt.text_block("Warning", "No column tags found. Run: python schema_tags.py", "⚠"))
 
         # Step 3: Schema (optional display)
         step_num = 3
-        if show_schema:
+        if show_schema and verbose:
             print(self.fmt.step(step_num, "Database Schema", "sqlite_master + PRAGMA"))
             print(self.fmt.schema_compact(self._get_schema_display()))
             step_num += 1
 
         # Step 4: Call LLM
-        print(self.fmt.step(step_num, "Translating to SQL", "Claude API (claude-sonnet-4-20250514)"))
+        if verbose:
+            print(self.fmt.step(step_num, "Translating to SQL", "Claude API (claude-sonnet-4-20250514)"))
 
         schema = self._get_schema_for_llm()
         tags_prompt = self._get_tags_for_prompt()
         prompt = self._build_prompt(question, schema, tags_prompt)
-        response = self._call_llm(prompt)
+        with spinner("writing"):
+            response = self._call_llm(prompt)
         parsed = self._parse_response(response)
 
-        # Show reasoning
-        if parsed.get('reasoning'):
+        # Show reasoning (verbose only)
+        if verbose and parsed.get('reasoning'):
             print(self.fmt.text_block("Reasoning", parsed['reasoning'], "💭"))
 
-        # Show set theory
-        if parsed.get('set_theory'):
+        # Show set theory (verbose only)
+        if verbose and parsed.get('set_theory'):
             print(self.fmt.text_block("Set Theory", parsed['set_theory'], "∴"))
 
-        # Show which tags were used
-        if parsed.get('tags_used'):
+        # Show which tags were used (verbose only)
+        if verbose and parsed.get('tags_used'):
             print(self.fmt.text_block("Tags Used", parsed['tags_used'], "🏷"))
 
-        # Step: Show SQL
+        # Step: Show SQL (verbose only)
         step_num += 1
-        print(self.fmt.step(step_num, "Generated SQL", "LLM output"))
+        if verbose:
+            print(self.fmt.step(step_num, "Generated SQL", "LLM output"))
         if parsed.get('sql'):
-            print(self.fmt.sql(parsed['sql']))
+            if verbose:
+                print(self.fmt.sql(parsed['sql']))
         else:
             print(self.fmt.error("No SQL generated"))
             return parsed
 
         # Step: Execute
         step_num += 1
-        print(self.fmt.step(step_num, "Execution", f"SQLite ({self.db_path})"))
+        if verbose:
+            print(self.fmt.step(step_num, "Execution", f"SQLite ({self.db_path})"))
 
         try:
             cursor = self.conn.cursor()
@@ -241,7 +252,8 @@ class NaturalLanguageQueryAgent:
             columns = [desc[0] for desc in cursor.description]
             results = [dict(zip(columns, row)) for row in rows]
 
-            print(self.fmt.table(results))
+            if verbose:
+                print(self.fmt.table(results))
 
             parsed['results'] = results
             parsed['success'] = True
@@ -254,15 +266,18 @@ class NaturalLanguageQueryAgent:
 
         # Step: Interpretation
         step_num += 1
-        print(self.fmt.step(step_num, "Interpretation", "Claude API"))
+        if verbose:
+            print(self.fmt.step(step_num, "Interpretation", "Claude API"))
 
-        interpretation = self._interpret_results(
-            question=question,
-            sql=parsed.get('sql', ''),
-            results=results,
-            reasoning=parsed.get('reasoning', '')
-        )
+        with spinner("reading"):
+            interpretation = self._interpret_results(
+                question=question,
+                sql=parsed.get('sql', ''),
+                results=results,
+                reasoning=parsed.get('reasoning', '')
+            )
 
+        # Always show Answer and Limitations
         if interpretation.get('summary'):
             print(self.fmt.text_block("Answer", interpretation['summary'], "💬"))
 
@@ -375,17 +390,19 @@ JSON only, no other text."""
     def interactive(self):
         """Run interactive query session."""
         print(self.fmt.header("SQL AGENT"))
+        verbose_status = f"{Colors.GREEN}ON{Colors.RESET}" if self.verbose else f"{Colors.DIM}OFF{Colors.RESET}"
         print(f"""
     {Colors.BOLD}Natural Language Database Query Agent{Colors.RESET}
 
     Commands:
       • Type a question in plain English
-      • {Colors.CYAN}schema{Colors.RESET}  - Show database structure
-      • {Colors.CYAN}tags{Colors.RESET}    - Show column tags & meanings
-      • {Colors.CYAN}help{Colors.RESET}    - Show example questions
-      • {Colors.CYAN}quit{Colors.RESET}    - Exit
+      • {Colors.CYAN}schema{Colors.RESET}   - Show database structure
+      • {Colors.CYAN}tags{Colors.RESET}     - Show column tags & meanings
+      • {Colors.CYAN}verbose{Colors.RESET}  - Toggle verbose mode [{verbose_status}{Colors.RESET}]
+      • {Colors.CYAN}help{Colors.RESET}     - Show example questions
+      • {Colors.CYAN}quit{Colors.RESET}     - Exit
 
-    {Colors.DIM}Tab to auto-fill example • Shift+arrows select • Cmd+Z undo{Colors.RESET}
+    {Colors.DIM}Ctrl+O toggle verbose • Tab auto-fill • Cmd+Z undo{Colors.RESET}
 """)
 
         # Example prompts that cycle through
@@ -404,12 +421,26 @@ JSON only, no other text."""
         # Set up key bindings
         bindings = KeyBindings()
 
+        # Reference to self for use in closure
+        agent = self
+
         @bindings.add('tab')
         def accept_placeholder(event):
             """Tab inserts the current example if buffer is empty."""
             buf = event.app.current_buffer
             if not buf.text:
                 buf.insert_text(examples[example_index[0]])
+
+        @bindings.add('c-o')  # Cmd+O on Mac (interpreted as Ctrl+O)
+        def toggle_verbose(event):
+            """Toggle verbose mode."""
+            agent.verbose = not agent.verbose
+            status = f"{Colors.GREEN}ON{Colors.RESET}" if agent.verbose else f"{Colors.DIM}OFF{Colors.RESET}"
+            print(f"\n    {Colors.CYAN}Verbose mode:{Colors.RESET} {status}")
+            if agent.verbose:
+                print(f"    {Colors.DIM}All steps will be shown{Colors.RESET}")
+            else:
+                print(f"    {Colors.DIM}Only Answer + Limitations will be shown{Colors.RESET}")
 
         # Set up prompt styling and history
         prompt_style = Style.from_dict({
@@ -458,6 +489,15 @@ JSON only, no other text."""
                 if question.lower() == 'help':
                     self._show_help()
                     continue
+                if question.lower() == 'verbose':
+                    self.verbose = not self.verbose
+                    status = f"{Colors.GREEN}ON{Colors.RESET}" if self.verbose else f"{Colors.DIM}OFF{Colors.RESET}"
+                    print(f"\n    {Colors.CYAN}Verbose mode:{Colors.RESET} {status}")
+                    if self.verbose:
+                        print(f"    {Colors.DIM}All steps will be shown{Colors.RESET}")
+                    else:
+                        print(f"    {Colors.DIM}Only Answer + Limitations will be shown{Colors.RESET}")
+                    continue
 
                 self.ask(question)
 
@@ -490,8 +530,16 @@ JSON only, no other text."""
 
     def _show_help(self):
         """Show example questions."""
-        print(self.fmt.header("EXAMPLE QUESTIONS"))
-        examples = """
+        print(self.fmt.header("HELP"))
+        verbose_status = f"{Colors.GREEN}ON{Colors.RESET}" if self.verbose else f"{Colors.DIM}OFF{Colors.RESET}"
+        help_text = """
+    {bold}Output Mode:{reset}
+      • {cyan}verbose{reset} - Toggle detailed output [{verbose_status}{reset}]
+      • {cyan}Ctrl+O{reset} - Keyboard shortcut for verbose toggle
+
+      {dim}Verbose OFF: Shows only Answer + Limitations
+      Verbose ON:  Shows all steps (tags, reasoning, SQL, results){reset}
+
     {bold}Basic Queries:{reset}
       • How many customers do we have?
       • What products are in the Electronics category?
@@ -511,8 +559,8 @@ JSON only, no other text."""
       • Who are our top 3 customers by spending?
       • What products have never been ordered?
       • What's the average order value per customer?
-""".format(bold=Colors.BOLD, reset=Colors.RESET)
-        print(examples)
+""".format(bold=Colors.BOLD, reset=Colors.RESET, cyan=Colors.CYAN, dim=Colors.DIM, verbose_status=verbose_status)
+        print(help_text)
 
 
 # =============================================================================

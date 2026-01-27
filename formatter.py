@@ -6,11 +6,16 @@ Provides clean, structured terminal output with:
 - Formatted tables for results
 - Syntax highlighting for SQL
 - Clean JSON display
+- Animated spinners for wait states
 """
 
 import re
+import sys
 import textwrap
+import threading
+import time
 from typing import Any
+from contextlib import contextmanager
 
 
 # Terminal width
@@ -240,11 +245,135 @@ class Formatter:
         return f"\n{Colors.DIM}{'─' * WIDTH}{Colors.RESET}"
 
 
+class Spinner:
+    """Animated spinner for long-running operations."""
+
+    # Themed animation sets
+    THEMES = {
+        "thinking": {
+            "frames": [
+                "    ( o.o)  thinking...  ",
+                "    (o. o)  thinking..   ",
+                "    ( o.o)  thinking.    ",
+                "    (o. o)  thinking     ",
+                "    ( o.o)  thinking.    ",
+                "    (o. o)  thinking..   ",
+            ],
+            "done": "    ( ^.^)  got it!",
+        },
+        "querying": {
+            "frames": [
+                "    [>    ]  querying db  ",
+                "    [=>   ]  querying db  ",
+                "    [==>  ]  querying db  ",
+                "    [ ==> ]  querying db  ",
+                "    [  ==>]  querying db  ",
+                "    [   =>]  querying db  ",
+                "    [    >]  querying db  ",
+                "    [   <=]  querying db  ",
+                "    [  <==]  querying db  ",
+                "    [ <== ]  querying db  ",
+                "    [<==  ]  querying db  ",
+                "    [<=   ]  querying db  ",
+            ],
+            "done": "    [=====]  done!",
+        },
+        "writing": {
+            "frames": [
+                "    /  writing sql       ",
+                "    /  writing sql.      ",
+                "    |  writing sql..     ",
+                "    |  writing sql...    ",
+                "    \\  writing sql....   ",
+                "    \\  writing sql.....  ",
+                "    |  writing sql...... ",
+                "    |  writing sql.......",
+            ],
+            "done": "    *  sql ready!",
+        },
+        "reading": {
+            "frames": [
+                "    ~(=^.^)  reading results      ",
+                "    ~(=^.^)>  reading results     ",
+                "    ~(=^.^)>>  reading results    ",
+                "    ~(=^.^)>>>  reading results   ",
+                "     ~(=^.^)>>>  reading results  ",
+                "      ~(=^.^)>>>  reading results ",
+                "       ~(=^.^)>>>  reading results",
+                "      ~(=^.^)>>>  reading results ",
+                "     ~(=^.^)>>>  reading results  ",
+                "    ~(=^.^)>>>  reading results   ",
+                "    ~(=^.^)>>  reading results    ",
+                "    ~(=^.^)>  reading results     ",
+            ],
+            "done": "    ~(=^.^)  all done!",
+        },
+    }
+
+    def __init__(self, theme: str = "thinking", speed: float = 0.12):
+        self.theme = self.THEMES.get(theme, self.THEMES["thinking"])
+        self.speed = speed
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _animate(self):
+        """Run the animation loop in a background thread."""
+        frames = self.theme["frames"]
+        i = 0
+        while not self._stop_event.is_set():
+            frame = frames[i % len(frames)]
+            sys.stdout.write(f"\r{Colors.CYAN}{frame}{Colors.RESET}")
+            sys.stdout.flush()
+            i += 1
+            self._stop_event.wait(self.speed)
+        # Clear the spinner line and show done message
+        sys.stdout.write(f"\r{' ' * (WIDTH)}\r")
+        sys.stdout.flush()
+
+    def start(self):
+        """Start the spinner animation."""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def stop(self, show_done: bool = False):
+        """Stop the spinner animation."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join()
+        if show_done:
+            done_msg = self.theme["done"]
+            sys.stdout.write(f"\r{Colors.GREEN}{done_msg}{Colors.RESET}\n")
+            sys.stdout.flush()
+
+
+@contextmanager
+def spinner(theme: str = "thinking", show_done: bool = False):
+    """Context manager for easy spinner usage.
+
+    Usage:
+        with spinner("thinking"):
+            slow_operation()
+    """
+    s = Spinner(theme=theme)
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop(show_done=show_done)
+
+
 def demo():
     """Demo the formatter."""
     f = Formatter()
 
     print(f.header("SQL AGENT OUTPUT DEMO"))
+
+    # Spinner demos
+    print(f.step(0, "Spinner Demos", ""))
+    for theme in ["thinking", "writing", "reading", "querying"]:
+        with spinner(theme, show_done=True):
+            time.sleep(2.5)
 
     print(f.step(1, "Analyzing Question", "User input"))
     print(f.text_block("Question", "Who are our top 3 customers by total spending?"))

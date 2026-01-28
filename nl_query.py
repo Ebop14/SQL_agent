@@ -233,11 +233,20 @@ class NaturalLanguageQueryAgent:
         step_num += 1
         if verbose:
             print(self.fmt.step(step_num, "Generated SQL", "LLM output"))
-        if parsed.get('sql'):
+        sql = parsed.get('sql')
+        # Treat string "null"/"None" and empty strings as no SQL
+        if isinstance(sql, str) and sql.strip().lower() in ('null', 'none', ''):
+            sql = None
+            parsed['sql'] = None
+
+        if sql:
             if verbose:
                 print(self.fmt.sql(parsed['sql']))
         else:
-            print(self.fmt.error("No SQL generated"))
+            if parsed.get('deflection'):
+                print(self.fmt.text_block("Not a database question", parsed['deflection'], "🔀"))
+            else:
+                print(self.fmt.error("No SQL generated"))
             return parsed
 
         # Step: Execute
@@ -303,7 +312,17 @@ The COLUMN TAGS above provide semantic meaning for each column. Use them to:
 - Choose the right columns for the query
 - Identify which columns to use for joins, filters, and aggregations
 
-Respond in JSON format:
+IMPORTANT: First, decide if this question can be answered with a SINGLE SQL query that returns concrete data.
+- Questions like "what are our profitability levers" or "how can we improve sales" are strategic/analytical and CANNOT be answered with one SQL query.
+- Questions like "what is our total revenue" or "who are our top customers" CAN be answered with SQL.
+
+If the question CANNOT be answered with a single SQL query, respond with this SHORT JSON only:
+{{
+    "sql": null,
+    "deflection": "I can only answer questions that map to a specific database query. Try asking something concrete, like: [suggest 1-2 specific questions relevant to what they asked]."
+}}
+
+If the question CAN be answered with SQL, respond in JSON format:
 {{
     "reasoning": "Step-by-step explanation of your interpretation",
     "set_theory": "Explain using set theory (joins as intersections, filters as selections, etc.)",
@@ -331,8 +350,11 @@ JSON only, no other text."""
 
     def _parse_response(self, response: str) -> dict:
         """Parse the LLM JSON response."""
+        # Strip markdown code fences if present
+        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', response.strip())
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned).strip()
         try:
-            return json.loads(response)
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             # Try to extract JSON
             match = re.search(r'\{[\s\S]*\}', response)
